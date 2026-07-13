@@ -1,2 +1,7 @@
-ipykernel
-# Add your runtime dependencies here, one per line.
+numpy
+pyvips
+tqdm
+Pillow
+opencv-python
+scikit-image
+omero-py
