@@ -1,0 +1,2 @@
+ipykernel
+# Add your runtime dependencies here, one per line.
