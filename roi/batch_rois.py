@@ -8,6 +8,7 @@ import json
 import re
 import logging
 import multiprocessing
+import argparse
 
 import pyvips as pv
 from tqdm import tqdm
@@ -29,9 +30,11 @@ OMERO_PORT = 443
 OMERO_USER = "mjbarrett"
 OMERO_PASS = "gzyxby01"
 
+# Default values
+
 PROJECT_ID = 51
 BASE_PATH = "/Volumes/Siren/Prostate_data/"
-NUM_WORKERS = 1
+NUM_WORKERS = 12
 
 # Set True to regenerate ROI masks and replace JP2 files and annotations.
 OVERWRITE = False
@@ -41,6 +44,12 @@ DOWNSAMPLE = 10
 
 # If True, overwrite existing _annot.jp2 file.
 NEW_ANNOTS = True
+
+# Text appended to the ROI mask annotation. Default: "_annot"
+SUFFIX = "_annot"
+
+# List of text annotations to include. If empty, or --all is added, all are included.
+TEXT_FILTER = []
 
 # Print completed image IDs and paths to stdout when True.
 PRINT_COMPLETED = True
@@ -96,7 +105,6 @@ def _init_worker() -> None:
     global _worker_conn
     # Disable pyvips operation/tile cache — without this, pyvips accumulates
     # decoded tiles across images and worker RAM grows without bound.
-    #TODO don't need pyvips?
     pv.cache_set_max(0)
     pv.cache_set_max_mem(0)
     pv.cache_set_max_files(0)
@@ -146,7 +154,7 @@ def uint_to_rgba(uint: int) -> int:
     return red, green, blue, alpha
 
 
-def _resolve_paths(image_id: int, name: str) -> tuple[str, str] | None:
+def _resolve_paths(image_id: int, name: str, base_path: str) -> tuple[str, str] | None:
     """Return (jp2_path, omero_id_path) for an image name, or None if unparseable."""
     match = NAME_RE.match(name)
     if not match:
@@ -227,7 +235,7 @@ def _is_conn_error(exc: BaseException) -> bool:
     )
 
 
-def getRois(img, roi_service=None):
+def get_rois(img, roi_service=None):
     """
     Gathers OMERO RoiI objects.
 
@@ -252,8 +260,8 @@ def getRois(img, roi_service=None):
     return rois
 
 
-def getShapesAsPoints(
-    img, point_downsample=4, img_downsample=1, roi_service=None
+def get_shapes_as_points(
+    img, point_downsample=4, img_downsample=1, roi_service=None, new_annots=False, text_filter=[]
 ) -> list[tuple[int, tuple[int, int, int], list[tuple[float, float]]]]:
     """
     Gathers Rectangles, Polygons, and Ellipses as a tuple containing the shapeId, its rgb val, and a tuple of yx points of its bounds.
@@ -280,44 +288,48 @@ def getShapesAsPoints(
     yx_shape = (sizeY, sizeX)
 
     shapes = []
-    for roi in getRois(img, roi_service):
+    for roi in get_rois(img, roi_service, text_filter):
 
         points = None
 
         for shape in roi.copyShapes():
-            if shape.getTextValue() is not None:
-                if (
-                    shape.getTextValue().getValue() == "Transferred Annotation"
-                    and NEW_ANNOTS is True
-                ):
+            if shape.getTextValue() is not None and text_filter != []:
+                if (shape.getTextValue().getValue() not in text_filter):
                     continue
-                elif (
-                    NEW_ANNOTS is False
-                    and shape.getTextValue().getValue() != "Transferred Annotation"
-                ):
-                    continue
-                elif (
-                    shape.getTextValue().getValue() == "Exclusion ROI"
-                ):
-                    continue
-                elif (
-                        shape.getTextValue().getValue() == "Vessel"
-                    ):
-                        continue
-                elif (
-                        shape.getTextValue().getValue() == "Urethra"
-                    ):
-                        continue
-                elif (
-                        shape.getTextValue().getValue() == "mask_use"
-                    ):
-                        continue
-                elif (
-                    "TMA" in shape.getTextValue().getValue()
-                ):
-                    continue
+
+                # TODO
+                # if (
+                #     shape.getTextValue().getValue() == "Transferred Annotation"
+                #     and new_annots is True
+                # ):
+                #     continue
+                # elif (
+                #     new_annots is False
+                #     and shape.getTextValue().getValue() != "Transferred Annotation"
+                # ):
+                #     continue
+                # elif (
+                #     shape.getTextValue().getValue() == "Exclusion ROI"
+                # ):
+                #     continue
+                # elif (
+                #         shape.getTextValue().getValue() == "Vessel"
+                #     ):
+                #         continue
+                # elif (
+                #         shape.getTextValue().getValue() == "Urethra"
+                #     ):
+                #         continue
+                # elif (
+                #         shape.getTextValue().getValue() == "mask_use"
+                #     ):
+                #         continue
+                # elif (
+                #     "TMA" in shape.getTextValue().getValue()
+                # ):
+                #     continue
                 
-            elif NEW_ANNOTS is False:
+            elif new_annots is False:
                 continue
             if type(shape) == RectangleI:
                 x = float(shape.getX().getValue()) / img_downsample
@@ -373,25 +385,33 @@ def getShapesAsPoints(
     return sorted(shapes)
 
 
-def get_roi_mask(image):
+def get_roi_mask(image, downsample: int, new_annots: bool, text_filter: list) -> np.array:
     rgb_mask = np.zeros(
         (
-            int(image.getSizeY() / DOWNSAMPLE),
-            int(image.getSizeX() / DOWNSAMPLE),
+            int(image.getSizeY() / downsample),
+            int(image.getSizeX() / downsample),
             image.getSizeC(),
         ),
         dtype=np.uint8,
     )
     rgb_mask[:] = 255
-    for id, rgb, xy in getShapesAsPoints(image, img_downsample=DOWNSAMPLE):
+    for id, rgb, xy in get_shapes_as_points(image, img_downsample=downsample, new_annots=new_annots, text_filter=text_filter):
         yx = np.array(xy, np.int32)  # Ensure the points are of integer type
         yx = yx.reshape((-1, 1, 2))  # Reshape to (-1, 1, 2)
         cv2.fillPoly(rgb_mask, [yx], color=rgb)
-    mask = Image.fromarray(rgb_mask)
-    return mask
+    return rgb_mask
 
 
-def create_roi_image(image_id: int) -> tuple[int, str] | None:
+def create_roi_image(kwargs) -> tuple[int, str] | None:
+    image_id = kwargs.get("image_id")
+    suffix = kwargs.get("suffix", SUFFIX)
+    text_filter = kwargs.get("text_filter", TEXT_FILTER) #TODO
+    base_path = kwargs.get("base_path", BASE_PATH)
+    overwrite = kwargs.get("overwrite", OVERWRITE)
+    downsample = kwargs.get("downsample", DOWNSAMPLE)
+    print_completed = kwargs.get("print_completed", PRINT_COMPLETED)
+    new_annots = kwargs.get("new_annots", NEW_ANNOTS)
+
     max_attempts = 3
     for attempt in range(1, max_attempts + 1):
         try:
@@ -403,20 +423,19 @@ def create_roi_image(image_id: int) -> tuple[int, str] | None:
                 return None
         
             name = image.getName()
-            paths = _resolve_paths(image_id, name)
+            paths = _resolve_paths(image_id, name, base_path)
             if paths is None:
                 return None
         
             jp2_path, omero_id_path = paths
-            #ext = "_annot.jp2" if NEW_ANNOTS else "_annot_old.jp2"
-            roi_path = jp2_path.replace(".jp2", "_annot.jp2")
+            roi_path = jp2_path.replace(".jp2", f"{suffix}.jp2")
             print(roi_path)
 
             already_local = os.path.exists(roi_path) and os.path.exists(omero_id_path)
-            if already_local and not OVERWRITE:
+            if already_local and not overwrite:
                 # Sidecar is written after upload, so its presence guarantees completion.
                 log.info("ROI %d already created and uploaded, skipping.", image_id)
-                if PRINT_COMPLETED:
+                if print_completed:
                     print(f"Completed ROI for image {image_id}: {roi_path}")
                 return (image_id, roi_path)
             else:
@@ -434,8 +453,10 @@ def create_roi_image(image_id: int) -> tuple[int, str] | None:
                 os.makedirs(os.path.dirname(roi_path), exist_ok=True)
 
                 # Create ROI mask and save to roi_path.
-                mask = get_roi_mask(image)
-                mask.save(roi_path)
+                roi_mask = get_roi_mask(image, downsample, new_annots)
+                roi_img = pv.Image.new_from_array(roi_mask)
+                del roi_mask
+                roi_img.write_to_file(roi_path)
                 log.info("Image %d: saved ROI → %s", image_id, roi_path)
 
             # Remove any existing annotation in this namespace before uploading.
@@ -444,7 +465,7 @@ def create_roi_image(image_id: int) -> tuple[int, str] | None:
             for ann in image.listAnnotations(ns=FILE_ANN_NS):
                 if hasattr(ann, "getFile"):
                     orig_file = ann.getFile()
-                    if orig_file is not None and (OVERWRITE or not orig_file.getName().endswith(".jp2")):
+                    if orig_file is not None and (overwrite or not orig_file.getName().endswith(".jp2")):
                         log.info(
                             "Image %d: removing old annotation '%s' (id=%d).",
                             image_id, orig_file.getName(), ann.getId(),
@@ -465,7 +486,7 @@ def create_roi_image(image_id: int) -> tuple[int, str] | None:
                 f.write("")
             log.info("ROI %d: wrote sidecar → %s", image_id, omero_id_path)
 
-            if PRINT_COMPLETED:
+            if print_completed:
                 print(f"Completed ROI for image {image_id}: {roi_path}")
 
             return (image_id, roi_path)
@@ -486,13 +507,80 @@ def create_roi_image(image_id: int) -> tuple[int, str] | None:
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
+
+def parse_args(argv: list) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Batch ROI mask generation and upload to OMERO.")
+    parser.add_argument(
+        "-a", "--all",
+        action="store_true",
+        help="Get all annotations regardless of text value."
+    )
+    parser.add_argument(
+        "-s", "--suffix",
+        type=str, 
+        default="_annot", 
+        help=f"Change the text appended to the ROI mask annotation (default: '{SUFFIX}')."
+    )
+    parser.add_argument(
+        "-f", "--text_filter",
+        type=str,
+        nargs="*",
+        default=[],
+        help="List of text values to include, e.g. --text 'Transferred Annotation' 'mask_use'."
+    )
+    parser.add_argument(
+        "-i", "--project-id",
+        type=int,
+        default=PROJECT_ID,
+        help="OMERO project ID to process."
+    )
+    parser.add_argument(
+        "-b", "--base-path",
+        type=str,
+        default=BASE_PATH,
+        help="Base path for output directories."
+    )
+    parser.add_argument(
+        "-w", "--num-workers",
+        type=int,
+        default=NUM_WORKERS,
+        help="Number of parallel workers."
+    )
+    parser.add_argument(
+        "-o", "--overwrite",
+        action="store_true",
+        default=OVERWRITE,
+        help="Overwrite existing ROI masks and annotations."
+    )
+    parser.add_argument(
+        "-d", "--downsample",
+        type=int, 
+        default=DOWNSAMPLE, 
+        help="Downsample factor for ROI mask generation."
+    )
+    parser.add_argument(
+        "-p", "--print-completed",
+        action="store_true",
+        default=PRINT_COMPLETED,
+        help="Print completed image IDs and paths to stdout."
+    )
+    parser.add_argument(
+        "-n", "--new-annots",
+        action="store_true",
+        default=NEW_ANNOTS,
+        help="Use new annotations (default: False)."
+    )
+    return parser.parse_args(argv)
+
+
 def main() -> None:
+    args = parse_args(sys.argv[1:])
     conn = _connect()
     conn.SERVICE_OPTS.setOmeroGroup(-1)
     try:
-        project = conn.getObject("Project", PROJECT_ID)
+        project = conn.getObject("Project", args.project_id)
         if project is None:
-            raise RuntimeError(f"Project {PROJECT_ID} not found.")
+            raise RuntimeError(f"Project {args.project_id} not found.")
 
         image_ids = [
             image.getId()
@@ -503,39 +591,30 @@ def main() -> None:
         conn.close()
             
     log.info("Found %d images in project %d. Starting pool of %d workers.",
-             len(image_ids), PROJECT_ID, NUM_WORKERS)
+             len(image_ids), args.project_id, args.num_workers)
     
-    image_ids = image_ids[:1]
+    image_ids = image_ids[:2]
+    kwargs_list = [
+        {
+            "image_id": image_id,
+            "suffix": args.suffix,
+            "text_filter": args.text_filter,
+            "base_path": args.base_path,
+            "overwrite": args.overwrite,
+            "downsample": args.downsample,
+            "print_completed": args.print_completed,
+            "new_annots": args.new_annots,
+        }
+        for image_id in image_ids
+    ]
     ctx = multiprocessing.get_context('fork')
-    with ctx.Pool(NUM_WORKERS, initializer=_init_worker) as pool:
+    with ctx.Pool(args.num_workers, initializer=_init_worker) as pool:
         results = list(tqdm(
-            pool.imap_unordered(create_roi_image, image_ids),
+            pool.imap_unordered(create_roi_image, kwargs_list),
             total=len(image_ids),
             desc="Images",
             unit="img",
         ))
-
-    # Merge new mappings into any existing JSON file.
-    mapping_path = os.path.join(BASE_PATH, "omero_id_mappings.json")
-    if os.path.exists(mapping_path):
-        with open(mapping_path, "r") as f:
-            mappings: dict[str, str] = json.load(f)
-    else:
-        mappings = {}
-
-    for result in results:
-        if result is not None:
-            omero_id, roi_path = result
-            if omero_id in mappings:
-                #TODO list for key?
-                mappings[str(omero_id)] = list(mappings[str(omero_id)] + [roi_path])
-            else:
-                mappings[str(omero_id)] = [roi_path]
-
-    # Upload mapping file to OMERO
-    with open(mapping_path, "w") as f:
-        json.dump(mappings, f, indent=2)
-    log.info("Wrote %d mappings to %s", len(mappings), mapping_path)
 
     log.info("Batch complete.")
 
