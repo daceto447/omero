@@ -474,7 +474,6 @@ def create_roi_image(kwargs) -> tuple[int, str] | None:
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
-
 def parse_args(argv: list) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Batch ROI mask generation and upload to OMERO.")
     parser.add_argument(
@@ -568,7 +567,6 @@ def main() -> None:
             
     log.info("Found %d images in project %d. Starting pool of %d workers.",
              len(image_ids), args.project_id, args.num_workers)
-    image_ids = image_ids[:3]
     
     if args.all:
         args.text_filter = []
