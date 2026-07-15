@@ -300,6 +300,7 @@ def get_shapes_as_points(
                 
             elif new_annots is False:
                 continue
+
             if type(shape) == RectangleI:
                 x = float(shape.getX().getValue()) / img_downsample
                 y = float(shape.getY().getValue()) / img_downsample
@@ -364,12 +365,32 @@ def get_roi_mask(image, downsample: int, new_annots: bool, text_filter: list) ->
         dtype=np.uint8,
     )
     rgb_mask[:] = 255
-    for id, rgb, xy in get_shapes_as_points(image, img_downsample=downsample, 
-                                            new_annots=new_annots, text_filter=text_filter):
+    points = get_shapes_as_points(image, img_downsample=downsample, 
+                                  new_annots=new_annots, text_filter=text_filter)
+    if points == None:
+        return np.array([])
+    for id, rgb, xy in points:
         yx = np.array(xy, np.int32)  # Ensure the points are of integer type
         yx = yx.reshape((-1, 1, 2))  # Reshape to (-1, 1, 2)
         cv2.fillPoly(rgb_mask, [yx], color=rgb)
     return rgb_mask
+
+
+def link_file_annot(conn: BlitzGateway, image, path: str, image_id: int) -> None:
+    for ann in image.listAnnotations(ns=FILE_ANN_NS):
+        if hasattr(ann, "getFile"):
+            orig_file = ann.getFile()
+            if orig_file.getName() == os.path.basename(path):
+                log.info("Existing ROI annotation for image %d", image_id)
+                return
+
+    file_ann = conn.createFileAnnfromLocalFile(
+        path,
+        mimetype="image/jp2",
+        ns=FILE_ANN_NS,
+    )
+    image.linkAnnotation(file_ann)
+    log.info("Image %d: uploaded ROI annotation to OMERO.", image_id)
 
 
 def create_roi_image(kwargs) -> tuple[int, str] | None:
@@ -402,9 +423,10 @@ def create_roi_image(kwargs) -> tuple[int, str] | None:
             already_local = os.path.exists(roi_path) and os.path.exists(omero_id_path)
             if already_local and not overwrite:
                 # Sidecar is written after upload, so its presence guarantees completion.
-                log.info("ROI %d already created and uploaded, skipping.", image_id)
+                log.info("ROI for image %d already created and uploaded, skipping.", image_id)
                 if PRINT_COMPLETED:
-                    print(f"Completed ROI for image {image_id}: {roi_path}")
+                    print(f"\nROI exists for image {image_id}: {roi_path}")
+                link_file_annot(conn, image, roi_path, image_id)
                 return (image_id, roi_path)
             else:
                 src_path = _get_source_file_path(conn, image_id)
@@ -422,40 +444,18 @@ def create_roi_image(kwargs) -> tuple[int, str] | None:
 
                 # Create ROI mask and save to roi_path.
                 roi_mask = get_roi_mask(image, downsample, new_annots, text_filter)
+                if roi_mask.size == 0:
+                    log.info("Image %d: No ROIs under filters %s", image_id, text_filter)
+                    return None
                 roi_img = pv.Image.new_from_array(roi_mask)
-                del roi_mask
+                del roi_mask # new_from_array copies the buffer; release the numpy allocation now
                 roi_img.write_to_file(roi_path)
                 log.info("Image %d: saved ROI → %s", image_id, roi_path)
 
-            # Remove any existing annotation in this namespace before uploading.
-            # In OVERWRITE mode this includes existing JP2s (the whole point);
-            # otherwise only remove stale non-JP2 annotations.
-            for ann in image.listAnnotations(ns=FILE_ANN_NS):
-                if hasattr(ann, "getFile"):
-                    orig_file = ann.getFile()
-                    if orig_file is not None and (overwrite or not orig_file.getName().endswith(".jp2")):
-                        log.info(
-                            "Image %d: removing old annotation '%s' (id=%d).",
-                            image_id, orig_file.getName(), ann.getId(),
-                        )
-                        image.removeAnnotations([ann])
-                        conn.deleteObject(ann._obj)
-
-            file_ann = conn.createFileAnnfromLocalFile(
-                roi_path,
-                mimetype="image/jp2",
-                ns=FILE_ANN_NS,
-            )
-            image.linkAnnotation(file_ann)
-            log.info("ROI %d: uploaded ROI annotation to OMERO.", image_id)
-
-            # Sidecar written after successful upload so its presence = upload done.
-            with open(omero_id_path, "w") as f:
-                f.write("")
-            log.info("ROI %d: wrote sidecar → %s", image_id, omero_id_path)
+            link_file_annot(conn, image, roi_path, image_id)
 
             if PRINT_COMPLETED:
-                print(f"Completed ROI for image {image_id}: {roi_path}")
+                print(f"\nCompleted ROI for image {image_id}: {roi_path}")
 
             return (image_id, roi_path)
 
@@ -504,9 +504,9 @@ def parse_args(argv: list) -> argparse.Namespace:
     parser.add_argument(
         "-t", "--text_filter",
         type=str.lower,
-        nargs="*",
+        action="append",
         default=[],
-        help="List of text values to include, e.g. --text 'Transferred Annotation' 'mask_use'."
+        help="List of text annotations to include, e.g. --text 'Transferred Annotation' --text 'mask_use'."
     )
     parser.add_argument(
         "-i", "--project-id",
@@ -569,7 +569,7 @@ def main() -> None:
             
     log.info("Found %d images in project %d. Starting pool of %d workers.",
              len(image_ids), args.project_id, args.num_workers)
-    image_ids = image_ids[:2]
+    image_ids = image_ids[:3]
     
     if args.all:
         args.text_filter = []
