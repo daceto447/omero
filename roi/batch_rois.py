@@ -6,6 +6,7 @@ import numpy as np
 import glob
 import json
 import re
+
 import logging
 import multiprocessing
 import argparse
@@ -27,8 +28,8 @@ from omero_model_RectangleI import RectangleI
 # ── Configuration ──────────────────────────────────────────────────────────────
 OMERO_HOST = "wss://wsi.lavlab.mcw.edu/omero-wss"
 OMERO_PORT = 443
-OMERO_USER = "mjbarrett"
-OMERO_PASS = """"
+OMERO_USER = "" # CLIs
+OMERO_PASS = ""
 
 # Default values
 
@@ -288,46 +289,14 @@ def get_shapes_as_points(
     yx_shape = (sizeY, sizeX)
 
     shapes = []
-    for roi in get_rois(img, roi_service, text_filter):
+    for roi in get_rois(img, roi_service):
 
         points = None
 
         for shape in roi.copyShapes():
             if shape.getTextValue() is not None and text_filter != []:
-                if (shape.getTextValue().getValue() not in text_filter):
+                if (shape.getTextValue().getValue().lower() not in text_filter):
                     continue
-
-                # TODO
-                # if (
-                #     shape.getTextValue().getValue() == "Transferred Annotation"
-                #     and new_annots is True
-                # ):
-                #     continue
-                # elif (
-                #     new_annots is False
-                #     and shape.getTextValue().getValue() != "Transferred Annotation"
-                # ):
-                #     continue
-                # elif (
-                #     shape.getTextValue().getValue() == "Exclusion ROI"
-                # ):
-                #     continue
-                # elif (
-                #         shape.getTextValue().getValue() == "Vessel"
-                #     ):
-                #         continue
-                # elif (
-                #         shape.getTextValue().getValue() == "Urethra"
-                #     ):
-                #         continue
-                # elif (
-                #         shape.getTextValue().getValue() == "mask_use"
-                #     ):
-                #         continue
-                # elif (
-                #     "TMA" in shape.getTextValue().getValue()
-                # ):
-                #     continue
                 
             elif new_annots is False:
                 continue
@@ -395,7 +364,8 @@ def get_roi_mask(image, downsample: int, new_annots: bool, text_filter: list) ->
         dtype=np.uint8,
     )
     rgb_mask[:] = 255
-    for id, rgb, xy in get_shapes_as_points(image, img_downsample=downsample, new_annots=new_annots, text_filter=text_filter):
+    for id, rgb, xy in get_shapes_as_points(image, img_downsample=downsample, 
+                                            new_annots=new_annots, text_filter=text_filter):
         yx = np.array(xy, np.int32)  # Ensure the points are of integer type
         yx = yx.reshape((-1, 1, 2))  # Reshape to (-1, 1, 2)
         cv2.fillPoly(rgb_mask, [yx], color=rgb)
@@ -405,11 +375,10 @@ def get_roi_mask(image, downsample: int, new_annots: bool, text_filter: list) ->
 def create_roi_image(kwargs) -> tuple[int, str] | None:
     image_id = kwargs.get("image_id")
     suffix = kwargs.get("suffix", SUFFIX)
-    text_filter = kwargs.get("text_filter", TEXT_FILTER) #TODO
+    text_filter = kwargs.get("text_filter", TEXT_FILTER)
     base_path = kwargs.get("base_path", BASE_PATH)
     overwrite = kwargs.get("overwrite", OVERWRITE)
     downsample = kwargs.get("downsample", DOWNSAMPLE)
-    print_completed = kwargs.get("print_completed", PRINT_COMPLETED)
     new_annots = kwargs.get("new_annots", NEW_ANNOTS)
 
     max_attempts = 3
@@ -429,13 +398,12 @@ def create_roi_image(kwargs) -> tuple[int, str] | None:
         
             jp2_path, omero_id_path = paths
             roi_path = jp2_path.replace(".jp2", f"{suffix}.jp2")
-            print(roi_path)
 
             already_local = os.path.exists(roi_path) and os.path.exists(omero_id_path)
             if already_local and not overwrite:
                 # Sidecar is written after upload, so its presence guarantees completion.
                 log.info("ROI %d already created and uploaded, skipping.", image_id)
-                if print_completed:
+                if PRINT_COMPLETED:
                     print(f"Completed ROI for image {image_id}: {roi_path}")
                 return (image_id, roi_path)
             else:
@@ -453,7 +421,7 @@ def create_roi_image(kwargs) -> tuple[int, str] | None:
                 os.makedirs(os.path.dirname(roi_path), exist_ok=True)
 
                 # Create ROI mask and save to roi_path.
-                roi_mask = get_roi_mask(image, downsample, new_annots)
+                roi_mask = get_roi_mask(image, downsample, new_annots, text_filter)
                 roi_img = pv.Image.new_from_array(roi_mask)
                 del roi_mask
                 roi_img.write_to_file(roi_path)
@@ -486,7 +454,7 @@ def create_roi_image(kwargs) -> tuple[int, str] | None:
                 f.write("")
             log.info("ROI %d: wrote sidecar → %s", image_id, omero_id_path)
 
-            if print_completed:
+            if PRINT_COMPLETED:
                 print(f"Completed ROI for image {image_id}: {roi_path}")
 
             return (image_id, roi_path)
@@ -511,6 +479,18 @@ def create_roi_image(kwargs) -> tuple[int, str] | None:
 def parse_args(argv: list) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Batch ROI mask generation and upload to OMERO.")
     parser.add_argument(
+        "-u", "--username",
+        type=str,
+        required=True,
+        help="OMERO username."
+    )
+    parser.add_argument(
+        "-p", "--password",
+        type=str,
+        required=True,
+        help="OMERO password."
+    )
+    parser.add_argument(
         "-a", "--all",
         action="store_true",
         help="Get all annotations regardless of text value."
@@ -522,8 +502,8 @@ def parse_args(argv: list) -> argparse.Namespace:
         help=f"Change the text appended to the ROI mask annotation (default: '{SUFFIX}')."
     )
     parser.add_argument(
-        "-f", "--text_filter",
-        type=str,
+        "-t", "--text_filter",
+        type=str.lower,
         nargs="*",
         default=[],
         help="List of text values to include, e.g. --text 'Transferred Annotation' 'mask_use'."
@@ -550,7 +530,7 @@ def parse_args(argv: list) -> argparse.Namespace:
         "-o", "--overwrite",
         action="store_true",
         default=OVERWRITE,
-        help="Overwrite existing ROI masks and annotations."
+        help=f"Overwrite existing ROI masks and annotations (default: {OVERWRITE})."
     )
     parser.add_argument(
         "-d", "--downsample",
@@ -559,22 +539,19 @@ def parse_args(argv: list) -> argparse.Namespace:
         help="Downsample factor for ROI mask generation."
     )
     parser.add_argument(
-        "-p", "--print-completed",
-        action="store_true",
-        default=PRINT_COMPLETED,
-        help="Print completed image IDs and paths to stdout."
-    )
-    parser.add_argument(
         "-n", "--new-annots",
         action="store_true",
         default=NEW_ANNOTS,
-        help="Use new annotations (default: False)."
+        help=f"Use new annotations (default: {NEW_ANNOTS})."
     )
     return parser.parse_args(argv)
 
 
 def main() -> None:
     args = parse_args(sys.argv[1:])
+    global OMERO_USER, OMERO_PASS
+    OMERO_USER = args.username
+    OMERO_PASS = args.password
     conn = _connect()
     conn.SERVICE_OPTS.setOmeroGroup(-1)
     try:
@@ -592,8 +569,10 @@ def main() -> None:
             
     log.info("Found %d images in project %d. Starting pool of %d workers.",
              len(image_ids), args.project_id, args.num_workers)
-    
     image_ids = image_ids[:2]
+    
+    if args.all:
+        args.text_filter = []
     kwargs_list = [
         {
             "image_id": image_id,
@@ -602,7 +581,6 @@ def main() -> None:
             "base_path": args.base_path,
             "overwrite": args.overwrite,
             "downsample": args.downsample,
-            "print_completed": args.print_completed,
             "new_annots": args.new_annots,
         }
         for image_id in image_ids
